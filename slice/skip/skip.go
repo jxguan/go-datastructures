@@ -60,7 +60,10 @@ package skip
 import (
 	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
+
+	"github.com/Workiva/go-datastructures/common"
 )
 
 const p = .5 // the p level defines the probability that a node
@@ -71,19 +74,37 @@ const p = .5 // the p level defines the probability that a node
 // items in the universe.  If p = .5 then maxlevel = 32 is appropriate
 // for uint32.
 
+// lockedSource is an implementation of rand.Source that is safe for
+// concurrent use by multiple goroutines. The code is modeled after
+// https://golang.org/src/math/rand/rand.go.
+type lockedSource struct {
+	mu  sync.Mutex
+	src rand.Source
+}
+
+// Int63 implements the rand.Source interface.
+func (ls *lockedSource) Int63() (n int64) {
+	ls.mu.Lock()
+	n = ls.src.Int63()
+	ls.mu.Unlock()
+	return
+}
+
+// Seed implements the rand.Source interface.
+func (ls *lockedSource) Seed(seed int64) {
+	ls.mu.Lock()
+	ls.src.Seed(seed)
+	ls.mu.Unlock()
+}
+
 // generator will be the common generator to create random numbers. It
 // is seeded with unix nanosecond when this line is executed at runtime,
 // and only executed once ensuring all random numbers come from the same
 // randomly seeded generator.
-var generator = rand.New(rand.NewSource(time.Now().UnixNano()))
-
-// rnLock protects the RNG as the generator is not threadsafe.
-var rnLock sync.Mutex
+var generator = rand.New(&lockedSource{src: rand.NewSource(time.Now().UnixNano())})
 
 func generateLevel(maxLevel uint8) uint8 {
 	var level uint8
-	rnLock.Lock()
-	defer rnLock.Unlock()
 	for level = uint8(1); level < maxLevel-1; level++ {
 		if generator.Float64() >= p {
 
@@ -94,13 +115,13 @@ func generateLevel(maxLevel uint8) uint8 {
 	return level
 }
 
-func insertNode(sl *SkipList, n *node, entry Entry, pos uint64, cache nodes, posCache widths, allowDuplicate bool) Entry {
-	if !allowDuplicate && n != nil && n.Compare(entry) == 0 { // a simple update in this case
+func insertNode(sl *SkipList, n *node, cmp common.Comparator, pos uint64, cache nodes, posCache widths, allowDuplicate bool) common.Comparator {
+	if !allowDuplicate && n != nil && n.Compare(cmp) == 0 { // a simple update in this case
 		oldEntry := n.entry
-		n.entry = entry
+		n.entry = cmp
 		return oldEntry
 	}
-	sl.num++
+	atomic.AddUint64(&sl.num, 1)
 
 	nodeLevel := generateLevel(sl.maxLevel)
 	if nodeLevel > sl.level {
@@ -110,7 +131,7 @@ func insertNode(sl *SkipList, n *node, entry Entry, pos uint64, cache nodes, pos
 		sl.level = nodeLevel
 	}
 
-	nn := newNode(entry, nodeLevel)
+	nn := newNode(cmp, nodeLevel)
 	for i := uint8(0); i < nodeLevel; i++ {
 		nn.forward[i] = cache[i].forward[i]
 		cache[i].forward[i] = nn
@@ -154,8 +175,8 @@ func splitAt(sl *SkipList, index uint64) (*SkipList, *SkipList) {
 		sl.cache[i].forward[i] = nil
 	}
 
-	right.num = sl.num - index
-	sl.num = sl.num - right.num
+	right.num = sl.Len() - index // right is not in user's hands yet
+	atomic.AddUint64(&sl.num, -right.num)
 
 	sl.resetMaxLevel()
 	right.resetMaxLevel()
@@ -196,21 +217,23 @@ func (sl *SkipList) init(ifc interface{}) {
 	sl.head = newNode(nil, sl.maxLevel)
 }
 
-func (sl *SkipList) search(e Entry, update nodes, widths widths) (*node, uint64) {
-	if sl.num == 0 { // nothing in the list
+func (sl *SkipList) search(cmp common.Comparator, update nodes, widths widths) (*node, uint64) {
+	if sl.Len() == 0 { // nothing in the list
 		return nil, 1
 	}
 
 	var pos uint64 = 0
 	var offset uint8
+	var alreadyChecked *node
 	n := sl.head
 	for i := uint8(0); i <= sl.level; i++ {
 		offset = sl.level - i
-		for n.forward[offset] != nil && n.forward[offset].Compare(e) < 0 {
+		for n.forward[offset] != nil && n.forward[offset] != alreadyChecked && n.forward[offset].Compare(cmp) < 0 {
 			pos += n.widths[offset]
 			n = n.forward[offset]
 		}
 
+		alreadyChecked = n
 		if update != nil {
 			update[offset] = n
 			widths[offset] = pos
@@ -231,11 +254,11 @@ func (sl *SkipList) resetMaxLevel() {
 }
 
 func (sl *SkipList) searchByPosition(position uint64, update nodes, widths widths) (*node, uint64) {
-	if sl.num == 0 { // nothing in the list
+	if sl.Len() == 0 { // nothing in the list
 		return nil, 1
 	}
 
-	if position > sl.num {
+	if position > sl.Len() {
 		return nil, 1
 	}
 
@@ -261,13 +284,13 @@ func (sl *SkipList) searchByPosition(position uint64, update nodes, widths width
 // Get will retrieve values associated with the keys provided.  If an
 // associated value could not be found, a nil is returned in its place.
 // This is an O(log n) operation.
-func (sl *SkipList) Get(entries ...Entry) Entries {
-	result := make(Entries, 0, len(entries))
+func (sl *SkipList) Get(comparators ...common.Comparator) common.Comparators {
+	result := make(common.Comparators, 0, len(comparators))
 
 	var n *node
-	for _, e := range entries {
-		n, _ = sl.search(e, nil, nil)
-		if n != nil && n.Compare(e) == 0 {
+	for _, cmp := range comparators {
+		n, _ = sl.search(cmp, nil, nil)
+		if n != nil && n.Compare(cmp) == 0 {
 			result = append(result, n.entry)
 		} else {
 			result = append(result, nil)
@@ -280,8 +303,8 @@ func (sl *SkipList) Get(entries ...Entry) Entries {
 // GetWithPosition will retrieve the value with the provided key and
 // return the position of that value within the list.  Returns nil, 0
 // if an associated value could not be found.
-func (sl *SkipList) GetWithPosition(e Entry) (Entry, uint64) {
-	n, pos := sl.search(e, nil, nil)
+func (sl *SkipList) GetWithPosition(cmp common.Comparator) (common.Comparator, uint64) {
+	n, pos := sl.search(cmp, nil, nil)
 	if n == nil {
 		return nil, 0
 	}
@@ -289,8 +312,8 @@ func (sl *SkipList) GetWithPosition(e Entry) (Entry, uint64) {
 	return n.entry, pos - 1
 }
 
-// ByPosition returns the entry at the given position.
-func (sl *SkipList) ByPosition(position uint64) Entry {
+// ByPosition returns the Comparator at the given position.
+func (sl *SkipList) ByPosition(position uint64) common.Comparator {
 	n, _ := sl.searchByPosition(position+1, nil, nil)
 	if n == nil {
 		return nil
@@ -299,63 +322,63 @@ func (sl *SkipList) ByPosition(position uint64) Entry {
 	return n.entry
 }
 
-func (sl *SkipList) insert(entry Entry) Entry {
-	n, pos := sl.search(entry, sl.cache, sl.posCache)
-	return insertNode(sl, n, entry, pos, sl.cache, sl.posCache, false)
+func (sl *SkipList) insert(cmp common.Comparator) common.Comparator {
+	n, pos := sl.search(cmp, sl.cache, sl.posCache)
+	return insertNode(sl, n, cmp, pos, sl.cache, sl.posCache, false)
 }
 
-// Insert will insert the provided entries into the list.  Returned
-// is a list of entries that were overwritten.  This is expected to
+// Insert will insert the provided comparators into the list.  Returned
+// is a list of comparators that were overwritten.  This is expected to
 // be an O(log n) operation.
-func (sl *SkipList) Insert(entries ...Entry) Entries {
-	overwritten := make(Entries, 0, len(entries))
-	for _, e := range entries {
-		overwritten = append(overwritten, sl.insert(e))
+func (sl *SkipList) Insert(comparators ...common.Comparator) common.Comparators {
+	overwritten := make(common.Comparators, 0, len(comparators))
+	for _, cmp := range comparators {
+		overwritten = append(overwritten, sl.insert(cmp))
 	}
 
 	return overwritten
 }
 
-func (sl *SkipList) insertAtPosition(position uint64, entry Entry) {
-	if position > sl.num {
-		position = sl.num
+func (sl *SkipList) insertAtPosition(position uint64, cmp common.Comparator) {
+	if position > sl.Len() {
+		position = sl.Len()
 	}
 	n, pos := sl.searchByPosition(position, sl.cache, sl.posCache)
-	insertNode(sl, n, entry, pos, sl.cache, sl.posCache, true)
+	insertNode(sl, n, cmp, pos, sl.cache, sl.posCache, true)
 }
 
-// InsertAtPosition will insert the provided entry and the provided position.
-// If position is greater than the length of the skiplist, the entry
+// InsertAtPosition will insert the provided Comparator at the provided position.
+// If position is greater than the length of the skiplist, the Comparator
 // is appended.  This method bypasses order checks and checks for
 // duplicates so use with caution.
-func (sl *SkipList) InsertAtPosition(position uint64, entry Entry) {
-	sl.insertAtPosition(position, entry)
+func (sl *SkipList) InsertAtPosition(position uint64, cmp common.Comparator) {
+	sl.insertAtPosition(position, cmp)
 }
 
-func (sl *SkipList) replaceAtPosition(position uint64, entry Entry) {
+func (sl *SkipList) replaceAtPosition(position uint64, cmp common.Comparator) {
 	n, _ := sl.searchByPosition(position+1, nil, nil)
 	if n == nil {
 		return
 	}
 
-	n.entry = entry
+	n.entry = cmp
 }
 
-// Replace at position will replace the entry at the provided position
-// with the provided entry.  If the provided position does not exist,
+// Replace at position will replace the Comparator at the provided position
+// with the provided Comparator.  If the provided position does not exist,
 // this operation is a no-op.
-func (sl *SkipList) ReplaceAtPosition(position uint64, entry Entry) {
-	sl.replaceAtPosition(position, entry)
+func (sl *SkipList) ReplaceAtPosition(position uint64, cmp common.Comparator) {
+	sl.replaceAtPosition(position, cmp)
 }
 
-func (sl *SkipList) delete(e Entry) Entry {
-	n, _ := sl.search(e, sl.cache, sl.posCache)
+func (sl *SkipList) delete(cmp common.Comparator) common.Comparator {
+	n, _ := sl.search(cmp, sl.cache, sl.posCache)
 
-	if n == nil || n.Compare(e) != 0 {
+	if n == nil || n.Compare(cmp) != 0 {
 		return nil
 	}
 
-	sl.num--
+	atomic.AddUint64(&sl.num, ^uint64(0)) // decrement
 
 	for i := uint8(0); i <= sl.level; i++ {
 		if sl.cache[i].forward[i] != n {
@@ -378,13 +401,13 @@ func (sl *SkipList) delete(e Entry) Entry {
 }
 
 // Delete will remove the provided keys from the skiplist and return
-// a list of in-order entries that were deleted.  This is a no-op if
+// a list of in-order Comparators that were deleted.  This is a no-op if
 // an associated key could not be found.  This is an O(log n) operation.
-func (sl *SkipList) Delete(entries ...Entry) Entries {
-	deleted := make(Entries, 0, len(entries))
+func (sl *SkipList) Delete(comparators ...common.Comparator) common.Comparators {
+	deleted := make(common.Comparators, 0, len(comparators))
 
-	for _, e := range entries {
-		deleted = append(deleted, sl.delete(e))
+	for _, cmp := range comparators {
+		deleted = append(deleted, sl.delete(cmp))
 	}
 
 	return deleted
@@ -392,7 +415,7 @@ func (sl *SkipList) Delete(entries ...Entry) Entries {
 
 // Len returns the number of items in this skiplist.
 func (sl *SkipList) Len() uint64 {
-	return sl.num
+	return atomic.LoadUint64(&sl.num)
 }
 
 func (sl *SkipList) iterAtPosition(pos uint64) *iterator {
@@ -413,8 +436,8 @@ func (sl *SkipList) IterAtPosition(pos uint64) Iterator {
 	return sl.iterAtPosition(pos + 1)
 }
 
-func (sl *SkipList) iter(e Entry) *iterator {
-	n, _ := sl.search(e, nil, nil)
+func (sl *SkipList) iter(cmp common.Comparator) *iterator {
+	n, _ := sl.search(cmp, nil, nil)
 	if n == nil {
 		return nilIterator()
 	}
@@ -428,8 +451,8 @@ func (sl *SkipList) iter(e Entry) *iterator {
 // Iter will return an iterator that can be used to iterate
 // over all the values with a key equal to or greater than
 // the key provided.
-func (sl *SkipList) Iter(e Entry) Iterator {
-	return sl.iter(e)
+func (sl *SkipList) Iter(cmp common.Comparator) Iterator {
+	return sl.iter(cmp)
 }
 
 // SplitAt will split the current skiplist into two lists.  The first
@@ -440,7 +463,7 @@ func (sl *SkipList) Iter(e Entry) Iterator {
 // the content of this list.
 func (sl *SkipList) SplitAt(index uint64) (*SkipList, *SkipList) {
 	index++ // 0-index offset
-	if index >= sl.num {
+	if index >= sl.Len() {
 		return sl, nil
 	}
 	return splitAt(sl, index)

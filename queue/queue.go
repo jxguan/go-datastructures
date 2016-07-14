@@ -55,6 +55,7 @@ import (
 	"runtime"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type waiters []*sema
@@ -73,6 +74,21 @@ func (w *waiters) get() *sema {
 
 func (w *waiters) put(sema *sema) {
 	*w = append(*w, sema)
+}
+
+func (w *waiters) remove(sema *sema) {
+	if len(*w) == 0 {
+		return
+	}
+	// build new slice, copy all except sema
+	ws := *w
+	newWs := make(waiters, 0, len(*w))
+	for i := range ws {
+		if ws[i] != sema {
+			newWs = append(newWs, ws[i])
+		}
+	}
+	*w = newWs
 }
 
 type items []interface{}
@@ -94,6 +110,16 @@ func (items *items) get(number int64) []interface{} {
 	return returnItems
 }
 
+func (items *items) peek() (interface{}, bool) {
+	length := len(*items)
+
+	if length == 0 {
+		return nil, false
+	}
+
+	return (*items)[0], true
+}
+
 func (items *items) getUntil(checker func(item interface{}) bool) []interface{} {
 	length := len(*items)
 
@@ -104,7 +130,7 @@ func (items *items) getUntil(checker func(item interface{}) bool) []interface{} 
 	}
 
 	returnItems := make([]interface{}, 0, length)
-	index := 0
+	index := -1
 	for i, item := range *items {
 		if !checker(item) {
 			break
@@ -112,20 +138,21 @@ func (items *items) getUntil(checker func(item interface{}) bool) []interface{} 
 
 		returnItems = append(returnItems, item)
 		index = i
+		(*items)[i] = nil // prevent memory leak
 	}
 
-	*items = (*items)[index:]
+	*items = (*items)[index+1:]
 	return returnItems
 }
 
 type sema struct {
-	wg       *sync.WaitGroup
+	ready    chan bool
 	response *sync.WaitGroup
 }
 
 func newSema() *sema {
 	return &sema{
-		wg:       &sync.WaitGroup{},
+		ready:    make(chan bool, 1),
 		response: &sync.WaitGroup{},
 	}
 }
@@ -149,7 +176,7 @@ func (q *Queue) Put(items ...interface{}) error {
 
 	if q.disposed {
 		q.lock.Unlock()
-		return disposedError
+		return ErrDisposed
 	}
 
 	q.items = append(q.items, items...)
@@ -159,8 +186,12 @@ func (q *Queue) Put(items ...interface{}) error {
 			break
 		}
 		sema.response.Add(1)
-		sema.wg.Done()
-		sema.response.Wait()
+		select {
+		case sema.ready <- true:
+			sema.response.Wait()
+		default:
+			// This semaphore timed out.
+		}
 		if len(q.items) == 0 {
 			break
 		}
@@ -170,11 +201,20 @@ func (q *Queue) Put(items ...interface{}) error {
 	return nil
 }
 
-// Get will add an item to the queue.  If there are some items in the
+// Get retrieves items from the queue.  If there are some items in the
 // queue, get will return a number UP TO the number passed in as a
 // parameter.  If no items are in the queue, this method will pause
 // until items are added to the queue.
 func (q *Queue) Get(number int64) ([]interface{}, error) {
+	return q.Poll(number, 0)
+}
+
+// Poll retrieves items from the queue.  If there are some items in the queue,
+// Poll will return a number UP TO the number passed in as a parameter.  If no
+// items are in the queue, this method will pause until items are added to the
+// queue or the provided timeout is reached.  A non-positive timeout will block
+// until items are added.  If a timeout occurs, ErrTimeout is returned.
+func (q *Queue) Poll(number int64, timeout time.Duration) ([]interface{}, error) {
 	if number < 1 {
 		// thanks again go
 		return []interface{}{}, nil
@@ -184,7 +224,7 @@ func (q *Queue) Get(number int64) ([]interface{}, error) {
 
 	if q.disposed {
 		q.lock.Unlock()
-		return nil, disposedError
+		return nil, ErrDisposed
 	}
 
 	var items []interface{}
@@ -192,22 +232,59 @@ func (q *Queue) Get(number int64) ([]interface{}, error) {
 	if len(q.items) == 0 {
 		sema := newSema()
 		q.waiters.put(sema)
-		sema.wg.Add(1)
 		q.lock.Unlock()
 
-		sema.wg.Wait()
-		// we are now inside the put's lock
-		if q.disposed {
-			return nil, disposedError
+		var timeoutC <-chan time.Time
+		if timeout > 0 {
+			timeoutC = time.After(timeout)
 		}
-		items = q.items.get(number)
-		sema.response.Done()
-		return items, nil
+		select {
+		case <-sema.ready:
+			// we are now inside the put's lock
+			if q.disposed {
+				return nil, ErrDisposed
+			}
+			items = q.items.get(number)
+			sema.response.Done()
+			return items, nil
+		case <-timeoutC:
+			// cleanup the sema that was added to waiters
+			select {
+			case sema.ready <- true:
+				// we called this before Put() could
+				// Remove sema from waiters.
+				q.lock.Lock()
+				q.waiters.remove(sema)
+				q.lock.Unlock()
+			default:
+				// Put() got it already, we need to call Done() so Put() can move on
+				sema.response.Done()
+			}
+			return nil, ErrTimeout
+		}
 	}
 
 	items = q.items.get(number)
 	q.lock.Unlock()
 	return items, nil
+}
+
+// Peek returns a the first item in the queue by value
+// without modifying the queue.
+func (q *Queue) Peek() (interface{}, error) {
+	q.lock.Lock()
+	defer q.lock.Unlock()
+
+	if q.disposed {
+		return nil, ErrDisposed
+	}
+
+	peekItem, ok := q.items.peek()
+	if !ok {
+		return nil, ErrEmptyQueue
+	}
+
+	return peekItem, nil
 }
 
 // TakeUntil takes a function and returns a list of items that
@@ -222,7 +299,7 @@ func (q *Queue) TakeUntil(checker func(item interface{}) bool) ([]interface{}, e
 
 	if q.disposed {
 		q.lock.Unlock()
-		return nil, disposedError
+		return nil, ErrDisposed
 	}
 
 	result := q.items.getUntil(checker)
@@ -255,20 +332,30 @@ func (q *Queue) Disposed() bool {
 	return q.disposed
 }
 
-// Dispose will dispose of this queue.  Any subsequent
-// calls to Get or Put will return an error.
-func (q *Queue) Dispose() {
+// Dispose will dispose of this queue and returns
+// the items disposed. Any subsequent calls to Get
+// or Put will return an error.
+func (q *Queue) Dispose() []interface{} {
 	q.lock.Lock()
 	defer q.lock.Unlock()
 
 	q.disposed = true
 	for _, waiter := range q.waiters {
 		waiter.response.Add(1)
-		waiter.wg.Done()
+		select {
+		case waiter.ready <- true:
+			// release Poll immediately
+		default:
+			// ignore if it's a timeout or in the get
+		}
 	}
+
+	disposedItems := q.items
 
 	q.items = nil
 	q.waiters = nil
+
+	return disposedItems
 }
 
 // New is a constructor for a new threadsafe queue.

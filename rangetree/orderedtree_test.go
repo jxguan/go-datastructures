@@ -43,7 +43,7 @@ func TestOTRootAddMultipleDimensions(t *testing.T) {
 
 	assert.Equal(t, uint64(1), tree.Len())
 
-	result := tree.Query(constructMockInterval(dimension{0, 1}, dimension{0, 1}))
+	result := tree.Query(constructMockInterval(dimension{0, 0}, dimension{0, 0}))
 	assert.Equal(t, Entries{entries[0]}, result)
 }
 
@@ -52,7 +52,7 @@ func TestOTMultipleAddMultipleDimensions(t *testing.T) {
 
 	assert.Equal(t, uint64(4), tree.Len())
 
-	result := tree.Query(constructMockInterval(dimension{0, 1}, dimension{0, 1}))
+	result := tree.Query(constructMockInterval(dimension{0, 0}, dimension{0, 0}))
 	assert.Equal(t, Entries{entries[0]}, result)
 
 	result = tree.Query(constructMockInterval(dimension{3, 4}, dimension{3, 4}))
@@ -61,7 +61,7 @@ func TestOTMultipleAddMultipleDimensions(t *testing.T) {
 	result = tree.Query(constructMockInterval(dimension{0, 4}, dimension{0, 4}))
 	assert.Equal(t, entries, result)
 
-	result = tree.Query(constructMockInterval(dimension{1, 3}, dimension{1, 3}))
+	result = tree.Query(constructMockInterval(dimension{1, 2}, dimension{1, 2}))
 	assert.Equal(t, Entries{entries[1], entries[2]}, result)
 
 	result = tree.Query(constructMockInterval(dimension{0, 2}, dimension{10, 20}))
@@ -70,10 +70,10 @@ func TestOTMultipleAddMultipleDimensions(t *testing.T) {
 	result = tree.Query(constructMockInterval(dimension{10, 20}, dimension{0, 2}))
 	assert.Len(t, result, 0)
 
-	result = tree.Query(constructMockInterval(dimension{0, 2}, dimension{0, 1}))
+	result = tree.Query(constructMockInterval(dimension{0, 1}, dimension{0, 0}))
 	assert.Equal(t, Entries{entries[0]}, result)
 
-	result = tree.Query(constructMockInterval(dimension{0, 1}, dimension{0, 2}))
+	result = tree.Query(constructMockInterval(dimension{0, 0}, dimension{0, 1}))
 	assert.Equal(t, Entries{entries[0]}, result)
 }
 
@@ -128,6 +128,32 @@ func TestOTAddLargeNumbersMultiDimension(t *testing.T) {
 	)
 	assert.Equal(t, numItems, tree.Len())
 	assert.Len(t, result, int(numItems))
+}
+
+func TestOTAddReturnsOverwritten(t *testing.T) {
+	tree := newOrderedTree(2)
+
+	starts := []uint64{0, 4, 2, 1, 3}
+
+	entries := make(Entries, 0, len(starts))
+	for _, start := range starts {
+		entries = append(entries, constructMockEntry(start, int64(start), int64(start)))
+	}
+
+	overwritten := tree.Add(entries...)
+
+	assert.Equal(t, Entries{nil, nil, nil, nil, nil}, overwritten)
+
+	oldEntry := entries[2]
+	newEntry := constructMockEntry(10, oldEntry.ValueAtDimension(1),
+		oldEntry.ValueAtDimension(2))
+	overwritten = tree.Add(newEntry)
+
+	assert.Equal(t, Entries{oldEntry}, overwritten)
+
+	result := tree.Query(constructMockInterval(dimension{0, 5}, dimension{0, 5}))
+	assert.Len(t, result, 5)
+	assert.Equal(t, uint64(5), tree.Len())
 }
 
 func BenchmarkOTAddItemsMultiDimensions(b *testing.B) {
@@ -192,7 +218,7 @@ func TestOTDeleteMultiDimensions(t *testing.T) {
 	result = tree.Query(constructMockInterval(dimension{3, 4}, dimension{3, 4}))
 	assert.Equal(t, Entries{entries[3]}, result)
 
-	result = tree.Query(constructMockInterval(dimension{0, 3}, dimension{0, 3}))
+	result = tree.Query(constructMockInterval(dimension{0, 2}, dimension{0, 2}))
 	assert.Equal(t, Entries{entries[0], entries[1]}, result)
 }
 
@@ -256,6 +282,29 @@ func TestOTDeleteEmptyTreeMultiDimensions(t *testing.T) {
 	assert.Equal(t, uint64(0), tree.Len())
 }
 
+func TestOTDeleteReturnsDeleted(t *testing.T) {
+	tree := newOrderedTree(2)
+
+	entries := NewEntries()
+	starts := []uint64{0, 4, 2, 1, 3}
+	for _, start := range starts {
+		entries = append(entries, constructMockEntry(start, int64(start), int64(start)))
+	}
+
+	tree.Add(entries...)
+
+	deleted := tree.Delete(entries[2], constructMockEntry(10, 10, 10))
+
+	assert.Equal(t, Entries{entries[2], nil}, deleted)
+
+	result := tree.Query(constructMockInterval(dimension{0, 11}, dimension{0, 11}))
+
+	assert.Len(t, result, 4)
+	assert.Equal(t, uint64(4), tree.Len())
+
+	assert.NotContains(t, result, entries[2])
+}
+
 func BenchmarkOTDeleteItemsMultiDimensions(b *testing.B) {
 	numItems := uint64(1000)
 	entries := make(Entries, 0, numItems)
@@ -295,6 +344,16 @@ func TestOverwrites(t *testing.T) {
 
 	overwritten = tree.Add(newEntry)
 	assert.Equal(t, Entries{entry}, overwritten)
+}
+
+func TestGet(t *testing.T) {
+	tree, entries := constructMultiDimensionalOrderedTree(2)
+
+	result := tree.Get(entries...)
+	assert.Equal(t, entries, result)
+
+	result = tree.Get(constructMockEntry(10000, 5000, 5000))
+	assert.Equal(t, Entries{nil}, result)
 }
 
 func TestTreeApply(t *testing.T) {
@@ -559,5 +618,27 @@ func BenchmarkDeleteSecondDimension(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		tree.InsertAtDimension(2, 0, -1)
+	}
+}
+
+func BenchmarkGetMultiDimensions(b *testing.B) {
+	numItemsX := 10000
+	numItemsY := 100
+
+	tree := newOrderedTree(2)
+	entries := make(Entries, 0, numItemsY*numItemsX)
+
+	for i := 0; i < numItemsX; i++ {
+		for j := 0; j < numItemsY; j++ {
+			e := constructMockEntry(uint64(j*numItemsY+i), int64(i), int64(j))
+			entries = append(entries, e)
+		}
+	}
+
+	tree.Add(entries...)
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		tree.Get(entries[i%len(entries)])
 	}
 }

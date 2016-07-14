@@ -21,12 +21,10 @@ this code is repeated instead of using casts to cast to interface{}
 back and forth.  If Go had inheritance and generics, this problem
 would be easier to solve.
 */
+
 package queue
 
-import (
-	"sort"
-	"sync"
-)
+import "sync"
 
 // Item is an item that can be added to the priority queue.
 type Item interface {
@@ -41,61 +39,79 @@ type Item interface {
 
 type priorityItems []Item
 
+func (items *priorityItems) swap(i, j int) {
+	(*items)[i], (*items)[j] = (*items)[j], (*items)[i]
+}
+
+func (items *priorityItems) pop() Item {
+	size := len(*items)
+
+	// Move last leaf to root, and 'pop' the last item.
+	items.swap(size-1, 0)
+	item := (*items)[size-1] // Item to return.
+	(*items)[size-1], *items = nil, (*items)[:size-1]
+
+	// 'Bubble down' to restore heap property.
+	index := 0
+	childL, childR := 2*index+1, 2*index+2
+	for len(*items) > childL {
+		child := childL
+		if len(*items) > childR && (*items)[childR].Compare((*items)[childL]) < 0 {
+			child = childR
+		}
+
+		if (*items)[child].Compare((*items)[index]) < 0 {
+			items.swap(index, child)
+
+			index = child
+			childL, childR = 2*index+1, 2*index+2
+		} else {
+			break
+		}
+	}
+
+	return item
+}
+
 func (items *priorityItems) get(number int) []Item {
 	returnItems := make([]Item, 0, number)
-	index := 0
 	for i := 0; i < number; i++ {
 		if i >= len(*items) {
 			break
 		}
 
-		returnItems = append(returnItems, (*items)[i])
-		(*items)[i] = nil
-		index++
+		returnItems = append(returnItems, items.pop())
 	}
 
-	*items = (*items)[index:]
 	return returnItems
 }
 
-func (items *priorityItems) insert(item Item) {
-	if len(*items) == 0 {
-		*items = append(*items, item)
-		return
+func (items *priorityItems) push(item Item) {
+	// Stick the item as the end of the last level.
+	*items = append(*items, item)
+
+	// 'Bubble up' to restore heap property.
+	index := len(*items) - 1
+	parent := int((index - 1) / 2)
+	for parent >= 0 && (*items)[parent].Compare(item) > 0 {
+		items.swap(index, parent)
+
+		index = parent
+		parent = int((index - 1) / 2)
 	}
-
-	equalFound := false
-	i := sort.Search(len(*items), func(i int) bool {
-		result := (*items)[i].Compare(item)
-		if result == 0 {
-			equalFound = true
-		}
-		return result >= 0
-	})
-
-	if equalFound {
-		return
-	}
-
-	if i == len(*items) {
-		*items = append(*items, item)
-		return
-	}
-
-	*items = append(*items, nil)
-	copy((*items)[i+1:], (*items)[i:])
-	(*items)[i] = item
 }
 
 // PriorityQueue is similar to queue except that it takes
 // items that implement the Item interface and adds them
 // to the queue in priority order.
 type PriorityQueue struct {
-	waiters     waiters
-	items       priorityItems
-	lock        sync.Mutex
-	disposeLock sync.Mutex
-	disposed    bool
+	waiters         waiters
+	items           priorityItems
+	itemMap         map[Item]struct{}
+	lock            sync.Mutex
+	disposeLock     sync.Mutex
+	disposed        bool
+	allowDuplicates bool
 }
 
 // Put adds items to the queue.
@@ -105,13 +121,19 @@ func (pq *PriorityQueue) Put(items ...Item) error {
 	}
 
 	pq.lock.Lock()
+	defer pq.lock.Unlock()
+
 	if pq.disposed {
-		pq.lock.Unlock()
-		return disposedError
+		return ErrDisposed
 	}
 
 	for _, item := range items {
-		pq.items.insert(item)
+		if pq.allowDuplicates {
+			pq.items.push(item)
+		} else if _, ok := pq.itemMap[item]; !ok {
+			pq.itemMap[item] = struct{}{}
+			pq.items.push(item)
+		}
 	}
 
 	for {
@@ -121,14 +143,13 @@ func (pq *PriorityQueue) Put(items ...Item) error {
 		}
 
 		sema.response.Add(1)
-		sema.wg.Done()
+		sema.ready <- true
 		sema.response.Wait()
 		if len(pq.items) == 0 {
 			break
 		}
 	}
 
-	pq.lock.Unlock()
 	return nil
 }
 
@@ -144,31 +165,39 @@ func (pq *PriorityQueue) Get(number int) ([]Item, error) {
 
 	if pq.disposed {
 		pq.lock.Unlock()
-		return nil, disposedError
+		return nil, ErrDisposed
 	}
 
 	var items []Item
 
+	// Remove references to popped items.
+	deleteItems := func(items []Item) {
+		for _, item := range items {
+			delete(pq.itemMap, item)
+		}
+	}
+
 	if len(pq.items) == 0 {
 		sema := newSema()
 		pq.waiters.put(sema)
-		sema.wg.Add(1)
 		pq.lock.Unlock()
 
-		sema.wg.Wait()
-		pq.disposeLock.Lock()
-		if pq.disposed {
-			pq.disposeLock.Unlock()
-			return nil, disposedError
+		<-sema.ready
+
+		if pq.Disposed() {
+			return nil, ErrDisposed
 		}
-		pq.disposeLock.Unlock()
 
 		items = pq.items.get(number)
+		if !pq.allowDuplicates {
+			deleteItems(items)
+		}
 		sema.response.Done()
 		return items, nil
 	}
 
 	items = pq.items.get(number)
+	deleteItems(items)
 	pq.lock.Unlock()
 	return items, nil
 }
@@ -202,8 +231,8 @@ func (pq *PriorityQueue) Len() int {
 
 // Disposed returns a bool indicating if this queue has been disposed.
 func (pq *PriorityQueue) Disposed() bool {
-	pq.lock.Lock()
-	defer pq.lock.Unlock()
+	pq.disposeLock.Lock()
+	defer pq.disposeLock.Unlock()
 
 	return pq.disposed
 }
@@ -220,7 +249,7 @@ func (pq *PriorityQueue) Dispose() {
 	pq.disposed = true
 	for _, waiter := range pq.waiters {
 		waiter.response.Add(1)
-		waiter.wg.Done()
+		waiter.ready <- true
 	}
 
 	pq.items = nil
@@ -228,8 +257,10 @@ func (pq *PriorityQueue) Dispose() {
 }
 
 // NewPriorityQueue is the constructor for a priority queue.
-func NewPriorityQueue(hint int) *PriorityQueue {
+func NewPriorityQueue(hint int, allowDuplicates bool) *PriorityQueue {
 	return &PriorityQueue{
-		items: make(priorityItems, 0, hint),
+		items:           make(priorityItems, 0, hint),
+		itemMap:         make(map[Item]struct{}, hint),
+		allowDuplicates: allowDuplicates,
 	}
 }

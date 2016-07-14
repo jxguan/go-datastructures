@@ -128,6 +128,27 @@ func TestPutToFull(t *testing.T) {
 	wg.Wait()
 }
 
+func TestOffer(t *testing.T) {
+	rb := NewRingBuffer(2)
+
+	ok, err := rb.Offer("foo")
+	assert.True(t, ok)
+	assert.Nil(t, err)
+	ok, err = rb.Offer("bar")
+	assert.True(t, ok)
+	assert.Nil(t, err)
+	ok, err = rb.Offer("baz")
+	assert.False(t, ok)
+	assert.Nil(t, err)
+
+	item, err := rb.Get()
+	assert.Nil(t, err)
+	assert.Equal(t, "foo", item)
+	item, err = rb.Get()
+	assert.Nil(t, err)
+	assert.Equal(t, "bar", item)
+}
+
 func TestRingGetEmpty(t *testing.T) {
 	rb := NewRingBuffer(3)
 
@@ -192,11 +213,9 @@ func TestDisposeOnGet(t *testing.T) {
 	}
 
 	spunUp.Wait()
-
 	rb.Dispose()
 
 	wg.Wait()
-
 	assert.True(t, rb.IsDisposed())
 }
 
@@ -261,30 +280,32 @@ func BenchmarkRBLifeCycle(b *testing.B) {
 }
 
 func BenchmarkRBPut(b *testing.B) {
-	rbs := make([]*RingBuffer, 0, b.N)
-
-	for i := 0; i < b.N; i++ {
-		rbs = append(rbs, NewRingBuffer(2))
-	}
+	rb := NewRingBuffer(uint64(b.N))
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		rbs[i].Put(i)
+		ok, err := rb.Offer(i)
+		if !ok {
+			b.Fail()
+		}
+		if err != nil {
+			b.Log(err)
+			b.Fail()
+		}
 	}
 }
 
 func BenchmarkRBGet(b *testing.B) {
-	rbs := make([]*RingBuffer, 0, b.N)
+	rb := NewRingBuffer(uint64(b.N))
 
 	for i := 0; i < b.N; i++ {
-		rbs = append(rbs, NewRingBuffer(2))
-		rbs[i].Put(i)
+		rb.Offer(i)
 	}
 
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		rbs[i].Get()
+		rb.Get()
 	}
 }

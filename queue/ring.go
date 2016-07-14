@@ -13,6 +13,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+
 package queue
 
 import (
@@ -48,8 +49,14 @@ type nodes []*node
 // described here: http://www.1024cores.net/home/lock-free-algorithms/queues/bounded-mpmc-queue
 // with some minor additions.
 type RingBuffer struct {
-	nodes                          nodes
-	queue, dequeue, mask, disposed uint64
+	_padding0      [8]uint64
+	queue          uint64
+	_padding1      [8]uint64
+	dequeue        uint64
+	_padding2      [8]uint64
+	mask, disposed uint64
+	_padding3      [8]uint64
+	nodes          nodes
 }
 
 func (rb *RingBuffer) init(size uint64) {
@@ -65,12 +72,25 @@ func (rb *RingBuffer) init(size uint64) {
 // call will block until an item is added to the queue or Dispose is called
 // on the queue.  An error will be returned if the queue is disposed.
 func (rb *RingBuffer) Put(item interface{}) error {
+	_, err := rb.put(item, false)
+	return err
+}
+
+// Offer adds the provided item to the queue if there is space.  If the queue
+// is full, this call will return false.  An error will be returned if the
+// queue is disposed.
+func (rb *RingBuffer) Offer(item interface{}) (bool, error) {
+	return rb.put(item, true)
+}
+
+func (rb *RingBuffer) put(item interface{}, offer bool) (bool, error) {
 	var n *node
 	pos := atomic.LoadUint64(&rb.queue)
+	i := 0
 L:
 	for {
 		if atomic.LoadUint64(&rb.disposed) == 1 {
-			return disposedError
+			return false, ErrDisposed
 		}
 
 		n = rb.nodes[pos&rb.mask]
@@ -85,12 +105,22 @@ L:
 		default:
 			pos = atomic.LoadUint64(&rb.queue)
 		}
-		runtime.Gosched() // free up the cpu before the next iteration
+
+		if offer {
+			return false, nil
+		}
+
+		if i == 10000 {
+			runtime.Gosched() // free up the cpu before the next iteration
+			i = 0
+		} else {
+			i++
+		}
 	}
 
 	n.data = item
 	atomic.StoreUint64(&n.position, pos+1)
-	return nil
+	return true, nil
 }
 
 // Get will return the next item in the queue.  This call will block
@@ -100,10 +130,11 @@ L:
 func (rb *RingBuffer) Get() (interface{}, error) {
 	var n *node
 	pos := atomic.LoadUint64(&rb.dequeue)
+	i := 0
 L:
 	for {
 		if atomic.LoadUint64(&rb.disposed) == 1 {
-			return nil, disposedError
+			return nil, ErrDisposed
 		}
 
 		n = rb.nodes[pos&rb.mask]
@@ -118,7 +149,13 @@ L:
 		default:
 			pos = atomic.LoadUint64(&rb.dequeue)
 		}
-		runtime.Gosched() // free up cpu before next iteration
+
+		if i == 10000 {
+			runtime.Gosched() // free up the cpu before the next iteration
+			i = 0
+		} else {
+			i++
+		}
 	}
 	data := n.data
 	n.data = nil

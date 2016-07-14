@@ -13,7 +13,6 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
-
 package rangetree
 
 func isLastDimension(value, test uint64) bool {
@@ -64,8 +63,8 @@ func (ot *orderedTree) add(entry Entry) *node {
 }
 
 // Add will add the provided entries to the tree.  This method
-// returns a list of cells that were overwritten in the order
-// in which cells were received.  If a cell doesn't overwrite
+// returns a list of entries that were overwritten in the order
+// in which entries were received.  If an entry doesn't overwrite
 // anything, a nil will be returned for that entry in the returned
 // slice.
 func (ot *orderedTree) Add(entries ...Entry) Entries {
@@ -73,24 +72,22 @@ func (ot *orderedTree) Add(entries ...Entry) Entries {
 		return nil
 	}
 
-	overwrittens := make(Entries, 0, len(entries))
-	for _, entry := range entries {
+	overwrittens := make(Entries, len(entries))
+	for i, entry := range entries {
 		if entry == nil {
 			continue
 		}
 
 		overwritten := ot.add(entry)
 		if overwritten != nil {
-			overwrittens = append(overwrittens, overwritten.entry)
-		} else {
-			overwrittens = append(overwrittens, nil)
+			overwrittens[i] = overwritten.entry
 		}
 	}
 
 	return overwrittens
 }
 
-func (ot *orderedTree) delete(entry Entry) {
+func (ot *orderedTree) delete(entry Entry) *node {
 	ot.resetPath()
 	var index int
 	var node *node
@@ -100,7 +97,7 @@ func (ot *orderedTree) delete(entry Entry) {
 		value := entry.ValueAtDimension(i)
 		node, index = list.get(value)
 		if node == nil { // there's nothing to delete
-			return
+			return nil
 		}
 
 		nb := &nodeBundle{list: list, index: index}
@@ -118,13 +115,61 @@ func (ot *orderedTree) delete(entry Entry) {
 			break
 		}
 	}
+
+	return node
 }
 
-// Delete will remove the entries from the tree.
-func (ot *orderedTree) Delete(entries ...Entry) {
-	for _, entry := range entries {
-		ot.delete(entry)
+func (ot *orderedTree) get(entry Entry) Entry {
+	on := ot.top
+	for i := uint64(1); i <= ot.dimensions; i++ {
+		n, _ := on.get(entry.ValueAtDimension(i))
+		if n == nil {
+			return nil
+		}
+		if i == ot.dimensions {
+			return n.entry
+		}
+		on = n.orderedNodes
 	}
+
+	return nil
+}
+
+// Get returns any entries that exist at the addresses provided by the
+// given entries.  Entries are returned in the order in which they are
+// received.  If an entry cannot be found, a nil is returned in its
+// place.
+func (ot *orderedTree) Get(entries ...Entry) Entries {
+	result := make(Entries, 0, len(entries))
+	for _, entry := range entries {
+		result = append(result, ot.get(entry))
+	}
+
+	return result
+}
+
+// Delete will remove the provided entries from the tree.
+// Any entries that were deleted will be returned in the order in
+// which they were deleted.  If an entry does not exist to be deleted,
+// a nil is returned for that entry's index in the provided cells.
+func (ot *orderedTree) Delete(entries ...Entry) Entries {
+	if len(entries) == 0 {
+		return nil
+	}
+
+	deletedEntries := make(Entries, len(entries))
+	for i, entry := range entries {
+		if entry == nil {
+			continue
+		}
+
+		deleted := ot.delete(entry)
+		if deleted != nil {
+			deletedEntries[i] = deleted.entry
+		}
+	}
+
+	return deletedEntries
 }
 
 // Len returns the number of items in the tree.

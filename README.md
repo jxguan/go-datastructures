@@ -21,7 +21,9 @@ Bitarray used to detect existence without having to resort to hashing with
 hashmaps.  Requires entities have a uint64 unique identifier.  Two
 implementations exist, regular and sparse.  Sparse saves a great deal of space
 but insertions are O(log n).  There are some useful functions on the BitArray
-interface to detect intersection between two bitarrays.
+interface to detect intersection between two bitarrays. This package also
+includes bitmaps of length 32 and 64 that provide increased speed and O(1) for
+all operations by storing the bitmaps in unsigned integers rather than arrays.
 
 #### Futures
 
@@ -43,7 +45,7 @@ slow currently and targeted for an update to a Fibonacci heap.
 Also included in the queue package is a MPMC threadsafe ring buffer. This is a
 block full/empty queue, but will return a blocked thread if the queue is
 disposed while a thread is blocked.  This can be used to synchronize goroutines
-and ensure goroutines quit so objects can be GC'd.  Threadsafety is acheived
+and ensure goroutines quit so objects can be GC'd.  Threadsafety is achieved
 using only CAS operations making this queue quite fast.  Benchmarks can be found
 in that package.
 
@@ -57,9 +59,11 @@ Inserts are typical BBST times at O(log n^d) where d is the number of
 dimensions.
 
 #### Set
-Self explanatory.  Could be further optimized by getting the uintptr of the
-generic interface{} used and using that as the key as Golang maps handle that
-much better than the generic struct type.
+Our Set implementation is very simple, accepts items of type `interface{}` and
+includes only a few methods. If your application requires a richer Set
+implementation over lists of type `sort.Interface`, see
+[xtgo/set](https://github.com/xtgo/set) and
+[goware/set](https://github.com/goware/set).
 
 #### Threadsafe
 A package that is meant to contain some commonly used items but in a threadsafe
@@ -89,7 +93,7 @@ can be found in that package.
 
 An extension of the X-Fast trie in which an X-Fast trie is combined with some
 other ordered data structure to reduce space consumption and improve CRUD types
-of operations.  These secondary structures are often BSTs, but our implemention
+of operations.  These secondary structures are often BSTs, but our implementation
 uses a simple ordered list as I believe this improves cache locality.  We also
 use fixed size buckets to aid in parallelization of operations.  Exact time
 complexities are in that package.
@@ -98,7 +102,7 @@ complexities are in that package.
 
 A datastructure used for checking existence but without knowing the bounds of
 your data.  If you have a limited small bounds, the bitarray package might be a
-better choice.  This implementation uses a fairly simple hashing alogrithm
+better choice.  This implementation uses a fairly simple hashing algorithm
 combined with linear probing and a flat datastructure to provide optimal
 performance up to a few million integers (faster than the native Golang
 implementation).  Beyond that, the native implementation is faster (I believe
@@ -107,7 +111,7 @@ with a B-tree for scale.
 
 #### Skiplist
 
-An ordered structure that provides amoritized logarithmic operations but without
+An ordered structure that provides amortized logarithmic operations but without
 the complication of rotations that are required by BSTs.  In testing, however,
 the performance of the skip list is often far worse than the guaranteed log n
 time of a BBST.  Tall nodes tend to "cast shadows", especially when large
@@ -127,7 +131,7 @@ symmetrical decomposition.
 Early work on some nonlinear optimization problems.  The initial implementation
 allows a simple use case with either linear or nonlinear constraints.  You can
 find min/max or target an optimal value.  The package currently employs a
-probablistic global restart system in an attempt to avoid local critical points.
+probabilistic global restart system in an attempt to avoid local critical points.
 More details can be found in that package.
 
 #### B+ Tree
@@ -140,6 +144,41 @@ implementation is mutable, but the immutable AVL tree can be used to build an
 immutable version.  Unfortunately, to make the B-tree generic we require an
 interface and the most expensive operation in CPU profiling is the interface
 method which in turn calls into runtime.assertI2T.  We need generics.
+
+#### Immutable B Tree
+A btree based on two principals, immutablability and concurrency. 
+Somewhat slow for single value lookups and puts, it is very fast for bulk operations.  
+A persister can be injected to make this index persistent.
+
+#### Ctrie
+
+A concurrent, lock-free hash array mapped trie with efficient non-blocking
+snapshots. For lookups, Ctries have comparable performance to concurrent skip
+lists and concurrent hashmaps. One key advantage of Ctries is they are
+dynamically allocated. Memory consumption is always proportional to the number
+of keys in the Ctrie, while hashmaps typically have to grow and shrink. Lookups,
+inserts, and removes are O(logn).
+
+One interesting advantage Ctries have over traditional concurrent data
+structures is support for lock-free, linearizable, constant-time snapshots.
+Most concurrent data structures do not support snapshots, instead opting for
+locks or requiring a quiescent state. This allows Ctries to have O(1) iterator
+creation and clear operations and O(logn) size retrieval.
+
+#### Dtrie
+
+A persistent hash trie that dynamically expands or shrinks to provide efficient
+memory allocation. Being persistent, the Dtrie is immutable and any modification
+yields a new version of the Dtrie rather than changing the original. Bitmapped
+nodes allow for O(log32(n)) get, remove, and update operations. Insertions are
+O(n) and iteration is O(1).
+
+#### Persistent List
+
+A persistent, immutable linked list. All write operations yield a new, updated
+structure which preserve and reuse previous versions. This uses a very
+functional, cons-style of list manipulation. Insert, get, remove, and size
+operations are O(n) as you would expect.
 
 ### Installation
 
@@ -182,4 +221,3 @@ Requirements to commit here:
 
  - Dustin Hiatt <[dustin.hiatt@workiva.com](mailto:dustin.hiatt@workiva.com)>
  - Alexander Campbell <[alexander.campbell@workiva.com](mailto:alexander.campbell@workiva.com)>
-

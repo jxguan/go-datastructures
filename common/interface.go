@@ -14,17 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package augmentedtree
+package common
 
-import "runtime"
-
-type trees []*tree
-
-func (t trees) split() []trees {
-	numParts := runtime.NumCPU()
-	parts := make([]trees, numParts)
-	for i := 0; i < numParts; i++ {
-		parts[i] = t[i*len(t)/numParts : (i+1)*len(t)/numParts]
-	}
-	return parts
+// Comparator is a generic interface that represents items that can
+// be compared.
+type Comparator interface {
+	// Compare compares this interface with another.  Returns a positive
+	// number if this interface is greater, 0 if equal, negative number
+	// if less.
+	Compare(Comparator) int
 }
+
+// Comparators is a typed list of type Comparator.
+type Comparators []Comparator

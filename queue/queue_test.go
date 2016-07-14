@@ -20,6 +20,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -79,6 +80,61 @@ func TestGet(t *testing.T) {
 	}
 
 	assert.Equal(t, `2`, result[0])
+}
+
+func TestPoll(t *testing.T) {
+	q := New(10)
+
+	// should be able to Poll() before anything is present, without breaking future Puts
+	q.Poll(1, time.Millisecond)
+
+	q.Put(`test`)
+	result, err := q.Poll(2, 0)
+	if !assert.Nil(t, err) {
+		return
+	}
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, `test`, result[0])
+	assert.Equal(t, int64(0), q.Len())
+
+	q.Put(`1`)
+	q.Put(`2`)
+
+	result, err = q.Poll(1, time.Millisecond)
+	if !assert.Nil(t, err) {
+		return
+	}
+
+	assert.Len(t, result, 1)
+	assert.Equal(t, `1`, result[0])
+	assert.Equal(t, int64(1), q.Len())
+
+	result, err = q.Poll(2, time.Millisecond)
+	if !assert.Nil(t, err) {
+		return
+	}
+
+	assert.Equal(t, `2`, result[0])
+
+	before := time.Now()
+	_, err = q.Poll(1, 5*time.Millisecond)
+	// This delta is normally 1-3 ms but running tests in CI with -race causes
+	// this to run much slower. For now, just bump up the threshold.
+	assert.InDelta(t, 5, time.Since(before).Seconds()*1000, 10)
+	assert.Equal(t, ErrTimeout, err)
+}
+
+func TestPollNoMemoryLeak(t *testing.T) {
+	q := New(0)
+
+	assert.Len(t, q.waiters, 0)
+
+	for i := 0; i < 10; i++ {
+		// Poll() should cleanup waiters after timeout
+		q.Poll(1, time.Nanosecond)
+		assert.Len(t, q.waiters, 0)
+	}
 }
 
 func TestAddEmptyPut(t *testing.T) {
@@ -169,6 +225,26 @@ func TestMultipleGetEmpty(t *testing.T) {
 	}
 }
 
+func TestDispose(t *testing.T) {
+	// when the queue is empty
+	q := New(10)
+	itemsDisposed := q.Dispose()
+
+	assert.Empty(t, itemsDisposed)
+
+	// when the queue is not empty
+	q = New(10)
+	q.Put(`1`)
+	itemsDisposed = q.Dispose()
+
+	expected := []interface{}{`1`}
+	assert.Equal(t, expected, itemsDisposed)
+
+	// when the queue has been disposed
+	itemsDisposed = q.Dispose()
+	assert.Nil(t, itemsDisposed)
+}
+
 func TestEmptyGetWithDispose(t *testing.T) {
 	q := New(10)
 	var wg sync.WaitGroup
@@ -189,7 +265,20 @@ func TestEmptyGetWithDispose(t *testing.T) {
 
 	wg.Wait()
 
-	assert.IsType(t, disposedError, err)
+	assert.IsType(t, ErrDisposed, err)
+}
+
+func TestDisposeAfterEmptyPoll(t *testing.T) {
+	q := New(10)
+
+	_, err := q.Poll(1, time.Millisecond)
+	assert.IsType(t, ErrTimeout, err)
+
+	// it should not hang
+	q.Dispose()
+
+	_, err = q.Poll(1, time.Millisecond)
+	assert.IsType(t, ErrDisposed, err)
 }
 
 func TestGetPutDisposed(t *testing.T) {
@@ -198,10 +287,10 @@ func TestGetPutDisposed(t *testing.T) {
 	q.Dispose()
 
 	_, err := q.Get(1)
-	assert.IsType(t, disposedError, err)
+	assert.IsType(t, ErrDisposed, err)
 
 	err = q.Put(`a`)
-	assert.IsType(t, disposedError, err)
+	assert.IsType(t, ErrDisposed, err)
 }
 
 func BenchmarkQueue(b *testing.B) {
@@ -252,6 +341,32 @@ func BenchmarkChannel(b *testing.B) {
 	wg.Wait()
 }
 
+func TestPeek(t *testing.T) {
+	q := New(10)
+	q.Put(`a`)
+	q.Put(`b`)
+	q.Put(`c`)
+	peekResult, err := q.Peek()
+	peekExpected := `a`
+	assert.Nil(t, err)
+	assert.Equal(t, q.Len(), int64(3))
+	assert.Equal(t, peekExpected, peekResult)
+
+	popResult, err := q.Get(1)
+	assert.Nil(t, err)
+	assert.Equal(t, peekResult, popResult[0])
+	assert.Equal(t, q.Len(), int64(2))
+}
+
+func TestPeekOnDisposedQueue(t *testing.T) {
+	q := New(10)
+	q.Dispose()
+	result, err := q.Peek()
+
+	assert.Nil(t, result)
+	assert.IsType(t, ErrDisposed, err)
+}
+
 func TestTakeUntil(t *testing.T) {
 	q := New(10)
 	q.Put(`a`, `b`, `c`)
@@ -281,6 +396,30 @@ func TestTakeUntilEmptyQueue(t *testing.T) {
 	assert.Equal(t, expected, result)
 }
 
+func TestTakeUntilThenGet(t *testing.T) {
+	q := New(10)
+	q.Put(`a`, `b`, `c`)
+	takeItems, _ := q.TakeUntil(func(item interface{}) bool {
+		return item != `c`
+	})
+
+	restItems, _ := q.Get(3)
+	assert.Equal(t, []interface{}{`a`, `b`}, takeItems)
+	assert.Equal(t, []interface{}{`c`}, restItems)
+}
+
+func TestTakeUntilNoMatches(t *testing.T) {
+	q := New(10)
+	q.Put(`a`, `b`, `c`)
+	takeItems, _ := q.TakeUntil(func(item interface{}) bool {
+		return item != `a`
+	})
+
+	restItems, _ := q.Get(3)
+	assert.Equal(t, []interface{}{}, takeItems)
+	assert.Equal(t, []interface{}{`a`, `b`, `c`}, restItems)
+}
+
 func TestTakeUntilOnDisposedQueue(t *testing.T) {
 	q := New(10)
 	q.Dispose()
@@ -289,7 +428,69 @@ func TestTakeUntilOnDisposedQueue(t *testing.T) {
 	})
 
 	assert.Nil(t, result)
-	assert.IsType(t, disposedError, err)
+	assert.IsType(t, ErrDisposed, err)
+}
+
+func TestWaiters(t *testing.T) {
+	s1, s2, s3, s4 := newSema(), newSema(), newSema(), newSema()
+
+	w := waiters{}
+	assert.Len(t, w, 0)
+
+	//
+	// test put()
+	w.put(s1)
+	assert.Equal(t, waiters{s1}, w)
+
+	w.put(s2)
+	w.put(s3)
+	w.put(s4)
+	assert.Equal(t, waiters{s1, s2, s3, s4}, w)
+
+	//
+	// test remove()
+	//
+	// remove from middle
+	w.remove(s2)
+	assert.Equal(t, waiters{s1, s3, s4}, w)
+
+	// remove non-existing element
+	w.remove(s2)
+	assert.Equal(t, waiters{s1, s3, s4}, w)
+
+	// remove from beginning
+	w.remove(s1)
+	assert.Equal(t, waiters{s3, s4}, w)
+
+	// remove from end
+	w.remove(s4)
+	assert.Equal(t, waiters{s3}, w)
+
+	// remove last element
+	w.remove(s3)
+	assert.Empty(t, w)
+
+	// remove non-existing element
+	w.remove(s3)
+	assert.Empty(t, w)
+
+	//
+	// test get()
+	//
+	// start with 3 elements in list
+	w.put(s1)
+	w.put(s2)
+	w.put(s3)
+	assert.Equal(t, waiters{s1, s2, s3}, w)
+
+	// get() returns each item in insertion order
+	assert.Equal(t, s1, w.get())
+	assert.Equal(t, s2, w.get())
+	w.put(s4) // interleave a put(), item should go to the end
+	assert.Equal(t, s3, w.get())
+	assert.Equal(t, s4, w.get())
+	assert.Empty(t, w)
+	assert.Nil(t, w.get())
 }
 
 func TestExecuteInParallel(t *testing.T) {
@@ -356,6 +557,28 @@ func BenchmarkQueueGet(b *testing.B) {
 		q := qs[i]
 		for j := int64(0); j < numItems; j++ {
 			q.Get(1)
+		}
+	}
+}
+
+func BenchmarkQueuePoll(b *testing.B) {
+	numItems := int64(1000)
+
+	qs := make([]*Queue, 0, b.N)
+
+	for i := 0; i < b.N; i++ {
+		q := New(numItems)
+		for j := int64(0); j < numItems; j++ {
+			q.Put(j)
+		}
+		qs = append(qs, q)
+	}
+
+	b.ResetTimer()
+
+	for _, q := range qs {
+		for j := int64(0); j < numItems; j++ {
+			q.Poll(1, time.Millisecond)
 		}
 	}
 }

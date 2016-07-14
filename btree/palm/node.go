@@ -18,11 +18,12 @@ package palm
 
 import (
 	"log"
+	"sort"
 
-	"github.com/Workiva/go-datastructures/slice/skip"
+	"github.com/Workiva/go-datastructures/common"
 )
 
-func getParent(parent *node, key Key) *node {
+func getParent(parent *node, key common.Comparator) *node {
 	var n *node
 	for parent != nil && !parent.isLeaf {
 		n = parent.searchNode(key)
@@ -33,100 +34,146 @@ func getParent(parent *node, key Key) *node {
 }
 
 type nodes struct {
-	list *skip.SkipList
+	list []*node
 }
 
 func (ns *nodes) push(n *node) {
-	ns.list.InsertAtPosition(ns.list.Len(), n)
+	ns.list = append(ns.list, n)
 }
 
-func (ns *nodes) splitAt(i uint64) (*nodes, *nodes) {
-	_, right := ns.list.SplitAt(i)
+func (ns *nodes) splitAt(i, capacity uint64) (*nodes, *nodes) {
+	i++
+	right := make([]*node, uint64(len(ns.list))-i, capacity)
+	copy(right, ns.list[i:])
+	for j := i; j < uint64(len(ns.list)); j++ {
+		ns.list[j] = nil
+	}
+	ns.list = ns.list[:i]
 	return ns, &nodes{list: right}
 }
 
 func (ns *nodes) byPosition(pos uint64) *node {
-	n, ok := ns.list.ByPosition(pos).(*node)
-	if !ok {
+	if pos >= uint64(len(ns.list)) {
 		return nil
 	}
 
-	return n
+	return ns.list[pos]
 }
 
 func (ns *nodes) insertAt(i uint64, n *node) {
-	ns.list.InsertAtPosition(i, n)
+	ns.list = append(ns.list, nil)
+	copy(ns.list[i+1:], ns.list[i:])
+	ns.list[i] = n
 }
 
 func (ns *nodes) replaceAt(i uint64, n *node) {
-	ns.list.ReplaceAtPosition(i, n)
+	ns.list[i] = n
 }
 
 func (ns *nodes) len() uint64 {
-	return ns.list.Len()
+	return uint64(len(ns.list))
 }
 
-func newNodes() *nodes {
+func newNodes(size uint64) *nodes {
 	return &nodes{
-		list: skip.New(uint64(0)),
+		list: make([]*node, 0, size),
 	}
 }
 
 type keys struct {
-	list *skip.SkipList
+	list common.Comparators
 }
 
-func (ks *keys) splitAt(i uint64) (*keys, *keys) {
-	_, right := ks.list.SplitAt(i)
+func (ks *keys) splitAt(i, capacity uint64) (*keys, *keys) {
+	i++
+	right := make(common.Comparators, uint64(len(ks.list))-i, capacity)
+	copy(right, ks.list[i:])
+	for j := i; j < uint64(len(ks.list)); j++ {
+		ks.list[j] = nil
+	}
+	ks.list = ks.list[:i]
 	return ks, &keys{list: right}
 }
 
 func (ks *keys) len() uint64 {
-	return ks.list.Len()
+	return uint64(len(ks.list))
 }
 
-func (ks *keys) byPosition(i uint64) Key {
-	k, ok := ks.list.ByPosition(i).(Key)
-	if !ok {
+func (ks *keys) byPosition(i uint64) common.Comparator {
+	if i >= uint64(len(ks.list)) {
+		return nil
+	}
+	return ks.list[i]
+}
+
+func (ks *keys) delete(k common.Comparator) common.Comparator {
+	i := ks.search(k)
+	if i >= uint64(len(ks.list)) {
 		return nil
 	}
 
-	return k
-}
-
-func (ks *keys) delete(k Key) {
-	ks.list.Delete(k.(skip.Entry))
-}
-
-func (ks *keys) search(key Key) uint64 {
-	n, i := ks.list.GetWithPosition(key.(skip.Entry))
-	if n == nil {
-		return ks.list.Len()
-	}
-
-	return i
-}
-
-func (ks *keys) insert(key Key) Key {
-	old := ks.list.Insert(key)[0]
-	if old == nil {
+	if ks.list[i].Compare(k) != 0 {
 		return nil
 	}
+	old := ks.list[i]
 
-	return old.(Key)
+	copy(ks.list[i:], ks.list[i+1:])
+	ks.list[len(ks.list)-1] = nil // GC
+	ks.list = ks.list[:len(ks.list)-1]
+	return old
 }
 
-func (ks *keys) last() Key {
-	return ks.list.ByPosition(ks.list.Len() - 1).(Key)
+func (ks *keys) search(key common.Comparator) uint64 {
+	i := sort.Search(len(ks.list), func(i int) bool {
+		return ks.list[i].Compare(key) > -1
+	})
+
+	return uint64(i)
 }
 
-func (ks *keys) insertAt(i uint64, k Key) {
-	ks.list.InsertAtPosition(i, k.(skip.Entry))
+func (ks *keys) insert(key common.Comparator) (common.Comparator, uint64) {
+	i := ks.search(key)
+	if i == uint64(len(ks.list)) {
+		ks.list = append(ks.list, key)
+		return nil, i
+	}
+
+	var old common.Comparator
+	if ks.list[i].Compare(key) == 0 {
+		old = ks.list[i]
+		ks.list[i] = key
+	} else {
+		ks.insertAt(i, key)
+	}
+
+	return old, i
 }
 
-func newKeys() *keys {
+func (ks *keys) last() common.Comparator {
+	return ks.list[len(ks.list)-1]
+}
+
+func (ks *keys) insertAt(i uint64, k common.Comparator) {
+	ks.list = append(ks.list, nil)
+	copy(ks.list[i+1:], ks.list[i:])
+	ks.list[i] = k
+}
+
+func (ks *keys) withPosition(k common.Comparator) (common.Comparator, uint64) {
+	i := ks.search(k)
+	if i == uint64(len(ks.list)) {
+		return nil, i
+	}
+	if ks.list[i].Compare(k) == 0 {
+		return ks.list[i], i
+	}
+
+	return nil, i
+}
+
+func newKeys(size uint64) *keys {
 	return &keys{
-		list: skip.New(uint64(0)),
+		list: make(common.Comparators, 0, size),
 	}
 }
 
@@ -141,67 +188,63 @@ func (n *node) needsSplit(ary uint64) bool {
 	return n.keys.len() >= ary
 }
 
-func (n *node) splitLeaf() (Key, *node, *node) {
-	i := n.keys.len() / 2
+func (n *node) splitLeaf(i, capacity uint64) (common.Comparator, *node, *node) {
 	key := n.keys.byPosition(i)
-	_, rightKeys := n.keys.splitAt(i)
+	_, rightKeys := n.keys.splitAt(i, capacity)
 	nn := &node{
 		keys:   rightKeys,
-		nodes:  newNodes(),
+		nodes:  newNodes(uint64(cap(n.nodes.list))),
 		isLeaf: true,
+		right:  n.right,
 	}
 	n.right = nn
 	return key, n, nn
 }
 
-func (n *node) splitInternal() (Key, *node, *node) {
-	i := n.keys.len() / 2
+func (n *node) splitInternal(i, capacity uint64) (common.Comparator, *node, *node) {
 	key := n.keys.byPosition(i)
 	n.keys.delete(key)
 
-	_, rightKeys := n.keys.splitAt(i - 1)
-	_, rightNodes := n.nodes.splitAt(i)
+	_, rightKeys := n.keys.splitAt(i-1, capacity)
+	_, rightNodes := n.nodes.splitAt(i, capacity)
 
 	nn := newNode(false, rightKeys, rightNodes)
-	for iter := rightNodes.list.IterAtPosition(0); iter.Next(); {
-		nd := iter.Value().(*node)
-		nd.parent = nn
+	for _, n := range rightNodes.list {
+		n.parent = nn
 	}
 
 	return key, n, nn
 }
 
-func (n *node) split() (Key, *node, *node) {
+func (n *node) split(i, capacity uint64) (common.Comparator, *node, *node) {
 	if n.isLeaf {
-		return n.splitLeaf()
+		return n.splitLeaf(i, capacity)
 	}
 
-	return n.splitInternal()
+	return n.splitInternal(i, capacity)
 }
 
-func (n *node) search(key Key) uint64 {
+func (n *node) search(key common.Comparator) uint64 {
 	return n.keys.search(key)
 }
 
-func (n *node) searchNode(key Key) *node {
+func (n *node) searchNode(key common.Comparator) *node {
 	i := n.search(key)
 
 	return n.nodes.byPosition(uint64(i))
 }
 
-func (n *node) key() Key {
+func (n *node) key() common.Comparator {
 	return n.keys.last()
 }
 
 func (n *node) print(output *log.Logger) {
 	output.Printf(`NODE: %+v, %p`, n, n)
-	for iter := n.keys.list.IterAtPosition(0); iter.Next(); {
-		k := iter.Value().(Key)
+	for _, k := range n.keys.list {
 		output.Printf(`KEY: %+v`, k)
 	}
 	if !n.isLeaf {
-		for iter := n.nodes.list.IterAtPosition(0); iter.Next(); {
-			n := iter.Value().(*node)
+		for _, n := range n.nodes.list {
 			if n == nil {
 				output.Println(`NIL NODE`)
 				continue
@@ -215,7 +258,7 @@ func (n *node) print(output *log.Logger) {
 // Compare is required by the skip.Entry interface but nodes are always
 // added by position so while this method is required it doesn't
 // need to return anything useful.
-func (n *node) Compare(e skip.Entry) int {
+func (n *node) Compare(e common.Comparator) int {
 	return 0
 }
 
